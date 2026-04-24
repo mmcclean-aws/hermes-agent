@@ -6100,7 +6100,15 @@ class AIAgent:
                                     _fire_first_delta()
                                     self._fire_reasoning_delta(thinking_text)
 
-                # Return the native Anthropic Message for downstream processing
+                # Return the native Anthropic Message for downstream processing.
+                # If the loop was broken early due to an interrupt, the SDK's
+                # internal snapshot may not be fully built yet, causing
+                # get_final_message() to raise AssertionError.  Detect this and
+                # raise a clean exception so the retry loop knows it's not a
+                # real API failure (the outer _call() handler checks for
+                # _interrupt_requested and short-circuits retries).
+                if self._interrupt_requested:
+                    raise InterruptedError("stream interrupted by user")
                 return stream.get_final_message()
 
         def _call():
@@ -6117,6 +6125,13 @@ class AIAgent:
                         else:
                             result["response"] = _call_chat_completions()
                         return  # success
+                    except InterruptedError:
+                        # Stream was cleanly interrupted by the user — not a
+                        # real API failure.  Set the error so the outer loop
+                        # can detect it, but do NOT retry or surface scary
+                        # "AssertionError" messages to the user.
+                        result["error"] = InterruptedError("stream interrupted by user")
+                        return
                     except Exception as e:
                         _is_timeout = isinstance(
                             e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout)

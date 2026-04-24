@@ -684,6 +684,22 @@ try:
 except Exception:
     pass
 
+# Neuter BaseSubprocessTransport.__del__ to suppress the benign
+# "RuntimeError: Event loop is closed" traceback printed on /exit.
+#
+# When the CLI shuts down, Python's GC finalizes anyio/asyncio subprocess
+# transport objects (used by MCP stdio servers).  Their __del__ calls
+# self.close() → proto.pipe.close() → loop.call_soon() on the *main*
+# event loop, which is already closed at that point.  This is harmless
+# (the MCP background loop + processes are already cleaned up by
+# shutdown_mcp_servers()) but produces a noisy traceback.  Neutering
+# __del__ is safe because all real cleanup happens in _run_cleanup().
+try:
+    import asyncio.base_subprocess as _bsp
+    _bsp.BaseSubprocessTransport.__del__ = lambda self: None  # type: ignore[assignment]
+except Exception:
+    pass
+
 from rich import box as rich_box
 from rich.console import Console
 from rich.markup import escape as _escape
@@ -2174,6 +2190,14 @@ class HermesCLI:
         agent = getattr(self, "agent", None)
         model_name = (getattr(agent, "model", None) or self.model or "unknown")
         model_short = model_name.split("/")[-1] if "/" in model_name else model_name
+        # Strip Bedrock cross-region inference profile prefix (e.g. global.anthropic.X -> claude-X)
+        _bedrock_prefixes = ("global.", "us.", "eu.", "ap.")
+        if any(model_short.startswith(p) for p in _bedrock_prefixes):
+            # Strip leading region prefix, then strip vendor prefix (e.g. anthropic.)
+            model_short = model_short.split(".", 1)[1]  # remove global./us./etc.
+        if "." in model_short and not model_short.startswith("claude"):
+            # Strip vendor prefix like anthropic.claude-X -> claude-X
+            model_short = model_short.split(".", 1)[1]
         if model_short.endswith(".gguf"):
             model_short = model_short[:-5]
         if len(model_short) > 26:
@@ -2441,11 +2465,21 @@ class HermesCLI:
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", duration_label),
                     ]
-                    # Position 7: per-prompt elapsed timer (live or frozen)
+                    # Per-prompt elapsed timer (live or frozen)
                     prompt_elapsed = snapshot.get("prompt_elapsed")
                     if prompt_elapsed:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-dim", prompt_elapsed))
+                    # Cache hit ratio — only shown when cache data is available
+                    cache_read = snapshot.get("session_cache_read_tokens", 0) or 0
+                    cache_write = snapshot.get("session_cache_write_tokens", 0) or 0
+                    raw_input = snapshot.get("session_input_tokens", 0) or 0
+                    if cache_read > 0 or cache_write > 0:
+                        total_input = raw_input + cache_read
+                        hit_pct = round((cache_read / total_input) * 100) if total_input > 0 else 0
+                        cache_label = f"💾 {hit_pct}%"
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-good", cache_label))
                     frags.append(("class:status-bar", " "))
 
             total_width = sum(self._status_bar_display_width(text) for _, text in frags)
