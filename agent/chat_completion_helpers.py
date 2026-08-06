@@ -1836,8 +1836,34 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # Determine api_mode from provider / base URL / model
         fb_api_mode = "chat_completions"
         fb_base_url = str(fb_client.base_url)
+        # An explicit ``api_mode`` on the fallback entry wins over the
+        # inference chain below. Without this, endpoints whose wire protocol
+        # is not derivable from the URL or the model name get silently
+        # mis-dialed. Concrete case: AWS Bedrock Mantle
+        # (``bedrock-mantle.<region>.api.aws/openai/v1``) serves GPT-5.x over
+        # the *Responses* API only, but it is reached through a named custom
+        # provider and its host is neither api.openai.com nor
+        # bedrock-runtime.*, so inference lands on ``chat_completions`` and
+        # every failover attempt 400s with "does not support the
+        # '/v1/chat/completions' API". The primary path already honours a
+        # configured api_mode (``_resolve_plain_custom_api_mode``); the
+        # fallback path must too, or a configured backup model is dead on
+        # arrival while looking correct in config.
+        _fb_configured_mode = str(fb.get("api_mode") or "").strip().lower()
+        _fb_mode_explicit = _fb_configured_mode in {
+            "chat_completions",
+            "codex_responses",
+            "anthropic_messages",
+            "bedrock_converse",
+        }
         _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
-        if fb_provider == "openai-codex":
+        if _fb_mode_explicit:
+            fb_api_mode = _fb_configured_mode
+            logger.info(
+                "Fallback %s/%s: using configured api_mode=%s",
+                fb_provider, fb_model, fb_api_mode,
+            )
+        elif fb_provider == "openai-codex":
             fb_api_mode = "codex_responses"
         elif fb_provider in {"nous", "nous-portal", "nousresearch"}:
             # Portal is dual-wire: anthropic/* must land on /v1/messages.
